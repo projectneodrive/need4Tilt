@@ -17,54 +17,93 @@ SPEED_CONVERSION = 3.6  # m/s -> km/h
 LINEAR_VEL_COLS = ['velocity_north', 'velocity_east', 'velocity_down']
 ANGLES_COLS = ['roll', 'pitch', 'yaw']
 
+# Admissible deltaT range for sampling
+FREQ_NOMINAL = 10.0  # Hz
+FREQ_MARGIN = 1.5    # Hz, tolerance
+DT_MIN = 1.0 / (FREQ_NOMINAL + FREQ_MARGIN)
+DT_MAX = 1.0 / (FREQ_NOMINAL - FREQ_MARGIN)
+
+# Realistic limits (street car)
+MAX_SPEED = 200  # km/h
+MIN_SPEED = 0
+MAX_VERTICAL_SPEED = 20  # m/s
+MAX_LINEAR_ACC = 10  # m/s²
+
 
 # -----------------------------
 # Helper functions
 # -----------------------------
-def compute_sampling_stats(timestamps):
-    """Compute mean frequency and jitter (per file)."""
-    dt = np.diff(timestamps) / 1e6  # microseconds -> seconds
-    mean_freq = 1.0 / np.mean(dt)
-    jitter = np.std(dt)
-    return mean_freq, jitter
+def reject_outliers(df):
+    """Reject rows that are impossible for a street car"""
+    speed = np.sqrt(df['velocity_north']**2 + df['velocity_east']**2 + df['velocity_down']**2) * SPEED_CONVERSION
+    mask = (speed >= MIN_SPEED) & (speed <= MAX_SPEED)
+    mask &= (np.abs(df['velocity_down']) <= MAX_VERTICAL_SPEED)
+    filtered_df = df[mask]
+    n_outliers = len(df) - len(filtered_df)
+    print(f"Removed {n_outliers} outliers ({100.0*n_outliers/len(df):.2f}% of dataset)")
+    return filtered_df
 
 
 def compute_linear_dynamics(df):
-    """Compute speed, acceleration along NED directions."""
-    # Linear speed magnitude (horizontal)
-    speed = np.sqrt(df['velocity_north'] ** 2 + df['velocity_east'] ** 2 + df['velocity_down'] ** 2)
-    # Linear accelerations (numerical derivative)
-    dt = np.diff(df['timestamp']) / 1e6
+    """Compute speed, acceleration along NED directions, dropping invalid dt."""
+    timestamps = df['timestamp'].values / 1e6  # seconds
+    dt = np.diff(timestamps)
+    valid_mask = (dt >= DT_MIN) & (dt <= DT_MAX)
+    valid_idx = np.where(valid_mask)[0] + 1
+
+    t_valid = timestamps[valid_idx]
+    vel_valid = {col: df[col].values[valid_idx] for col in LINEAR_VEL_COLS}
+
+    speed = np.sqrt(
+        vel_valid['velocity_north'] ** 2 +
+        vel_valid['velocity_east'] ** 2 +
+        vel_valid['velocity_down'] ** 2
+    )
+
     acc = {}
     for col in LINEAR_VEL_COLS:
-        vel = df[col].values
-        a = np.diff(vel) / dt
-        acc[col] = a
-    return speed, acc
+        acc[col] = np.gradient(vel_valid[col], t_valid)
+
+    return t_valid, speed, acc
 
 
 def compute_angular_dynamics(df):
-    """Compute angular velocity and angular acceleration."""
-    dt = np.diff(df['timestamp']) / 1e6
+    """Compute angular velocity and acceleration, dropping invalid dt."""
+    timestamps = df['timestamp'].values / 1e6
+    dt = np.diff(timestamps)
+    valid_mask = (dt >= DT_MIN) & (dt <= DT_MAX)
+    valid_idx = np.where(valid_mask)[0] + 1
+
+    t_valid = timestamps[valid_idx]
     ang_vel = {}
     ang_acc = {}
     for col in ANGLES_COLS:
-        angle = df[col].values
-        w = np.diff(angle) / dt  # angular velocity
+        angle_valid = df[col].values[valid_idx]
+        w = np.gradient(angle_valid, t_valid)
+        alpha = np.gradient(w, t_valid)
         ang_vel[col] = w
-        alpha = np.diff(w) / dt[:-1]  # angular acceleration
         ang_acc[col] = alpha
-    return ang_vel, ang_acc
+
+    return t_valid, ang_vel, ang_acc
 
 
 def compute_sampling_stats(timestamps):
-    """Compute mean frequency and jitter (per file). Handles short/empty traces."""
     if len(timestamps) < 2:
-        return np.nan, np.nan  # Not enough samples to compute dt
-    dt = np.diff(timestamps) / 1e6  # microseconds -> seconds
+        return np.nan, np.nan
+    dt = np.diff(timestamps) / 1e6
     mean_freq = 1.0 / np.mean(dt)
     jitter = np.std(dt)
     return mean_freq, jitter
+
+
+def print_stats(name, data):
+    data = np.array(data)
+    print(f"--- {name} ---")
+    print(f"Mean:   {np.mean(data):.4f}")
+    print(f"Median: {np.median(data):.4f}")
+    print(f"Std:    {np.std(data):.4f}")
+    print(f"Min:    {np.min(data):.4f}")
+    print(f"Max:    {np.max(data):.4f}\n")
 
 
 # -----------------------------
@@ -83,46 +122,50 @@ for file in all_files:
     mean_freq, jitter = compute_sampling_stats(df['timestamp'].values)
     sampling_stats.append({'file': file, 'mean_freq': mean_freq, 'jitter': jitter})
 
-# Aggregate into a single DataFrame
 full_df = pd.concat(dfs, ignore_index=True)
-print(full_df)
-print("------------------------------")
 print(f"Total number of samples: {len(full_df)}")
 
 # -----------------------------
-# Sampling frequency summary
+# Sampling stats summary
 # -----------------------------
 sampling_df = pd.DataFrame(sampling_stats)
-# Remove files that had insufficient samples (NaN)
 sampling_df_clean = sampling_df.dropna(subset=['mean_freq', 'jitter'])
 print("\nPer-file sampling statistics (valid files only):")
 print(sampling_df_clean.describe())
 
 # -----------------------------
-# Compute linear dynamics
+# Reject outliers
 # -----------------------------
-speed, acc = compute_linear_dynamics(full_df)
+full_df = reject_outliers(full_df)
 
-# Horizontal speed distribution (km/h)
+# -----------------------------
+# Compute dynamics
+# -----------------------------
+t_valid, speed, acc = compute_linear_dynamics(full_df)
 speed_kmh = speed * SPEED_CONVERSION
-
-# Vertical speed (velocity_down)
 vert_speed = full_df['velocity_down'].values
+t_valid, ang_vel, ang_acc = compute_angular_dynamics(full_df)
 
 # -----------------------------
-# Compute angular dynamics
+# Print statistics
 # -----------------------------
-ang_vel, ang_acc = compute_angular_dynamics(full_df)
+print_stats("Speed (km/h)", speed_kmh)
+print_stats("Vertical speed (m/s)", vert_speed)
+for col in LINEAR_VEL_COLS:
+    print_stats(f"Linear acceleration {col} (m/s²)", acc[col])
+for col in ANGLES_COLS:
+    print_stats(f"Angular position {col} (rad)", full_df[col])
+    print_stats(f"Angular velocity {col} (rad/s)", ang_vel[col])
+    print_stats(f"Angular acceleration {col} (rad/s²)", ang_acc[col])
 
 # -----------------------------
-# Plot distributions (normalized to 0-100%) with x-axis limits
+# Plot distributions
 # -----------------------------
 plt.figure(figsize=(15, 10))
 
 def plot_hist_percent(ax, data, bins=50, color='b', alpha=0.5, label=None, xlim=None):
-    """Helper to plot histogram as % instead of counts with axis limits"""
     counts, bin_edges = np.histogram(data, bins=bins)
-    counts = counts / counts.sum() * 100  # convert to %
+    counts = counts / counts.sum() * 100
     ax.bar(bin_edges[:-1], counts, width=np.diff(bin_edges), align='edge', color=color, alpha=alpha, label=label)
     if label:
         ax.legend()
@@ -130,27 +173,26 @@ def plot_hist_percent(ax, data, bins=50, color='b', alpha=0.5, label=None, xlim=
     if xlim:
         ax.set_xlim(xlim)
 
-# Speed (0-130 km/h)
+# Speed
 ax1 = plt.subplot(3, 3, 1)
 plot_hist_percent(ax1, speed_kmh, bins=50, color='skyblue', xlim=(0, 130))
 ax1.set_xlabel('Speed (km/h)')
 ax1.set_title('Speed Distribution')
 
-# Vertical speed (-5 to 5 m/s)
+# Vertical speed
 ax2 = plt.subplot(3, 3, 2)
 plot_hist_percent(ax2, vert_speed, bins=50, color='salmon', xlim=(-5, 5))
 ax2.set_xlabel('Vertical speed (m/s)')
 ax2.set_title('Vertical Speed Distribution')
 
-# Linear acceleration (-30 to 30 m/s²)
+# Linear acceleration
 ax3 = plt.subplot(3, 3, 3)
 for col, color in zip(LINEAR_VEL_COLS, ['r','g','b']):
-    plot_hist_percent(ax3, acc[col], bins=50, color=color, label=col, xlim=(-30, 30))
+    plot_hist_percent(ax3, acc[col], bins=50, color=color, label=col, xlim=(-10, 10))
 ax3.set_xlabel('Linear Acceleration (m/s²)')
 ax3.set_title('Linear Acceleration Distribution')
 
-# Angular positions (split into 3 plots) limited to ±π
-
+# Angular positions (split)
 ax = plt.subplot(3, 3, 4)
 plot_hist_percent(ax, full_df["roll"], bins=1000, color='c', label="roll", xlim=(-0.2, 0.2))
 ax.set_xlabel('roll (rad)')
@@ -158,7 +200,7 @@ ax.set_title('Angular Position: roll')
 
 ax = plt.subplot(3, 3, 5)
 plot_hist_percent(ax, full_df["pitch"], bins=1000, color='c', label="pitch", xlim=(-0.2, 0.2))
-ax.set_xlabel(f'pitch (rad)')
+ax.set_xlabel('pitch (rad)')
 ax.set_title('Angular Position: pitch')
 
 ax = plt.subplot(3, 3, 6)
@@ -166,14 +208,14 @@ plot_hist_percent(ax, full_df["yaw"], bins=200, color='c', label="yaw", xlim=(-n
 ax.set_xlabel('yaw (rad)')
 ax.set_title('Angular Position: yaw')
 
-# Angular velocity (-π to π rad/s)
+# Angular velocity
 ax7 = plt.subplot(3, 3, 7)
 for col, color in zip(ANGLES_COLS, ['r','g','b']):
     plot_hist_percent(ax7, ang_vel[col], bins=50, color=color, label=col, xlim=(-np.pi, np.pi))
 ax7.set_xlabel('Angular velocity (rad/s)')
 ax7.set_title('Angular Velocity Distribution')
 
-# Angular acceleration (-π to π rad/s²)
+# Angular acceleration
 ax8 = plt.subplot(3, 3, 8)
 for col, color in zip(ANGLES_COLS, ['r','g','b']):
     plot_hist_percent(ax8, ang_acc[col], bins=50, color=color, label=col, xlim=(-np.pi, np.pi))
