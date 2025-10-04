@@ -29,6 +29,9 @@ MIN_SPEED = 0
 MAX_VERTICAL_SPEED = 20  # m/s
 MAX_LINEAR_ACC = 10  # m/s²
 
+# Percentile cutoff for per-column filtering
+PERCENTILE_LIMIT = 99.99  # adjustable
+
 
 # -----------------------------
 # Helper functions
@@ -106,6 +109,36 @@ def print_stats(name, data):
     print(f"Max:    {np.max(data):.4f}\n")
 
 
+def filter_column_outliers(data, label, percentile=PERCENTILE_LIMIT):
+    """Filter out values outside the percentile range, column-wise."""
+    lower = np.nanpercentile(data, 100 - percentile)
+    upper = np.nanpercentile(data, percentile)
+    mask = (data >= lower) & (data <= upper)
+    filtered = data[mask]
+    n_total = len(data)
+    n_kept = np.count_nonzero(mask)
+    removed_pct = 100.0 * (n_total - n_kept) / n_total
+    print(f"[{label}] Filtered {removed_pct:.3f}% ({n_total - n_kept}/{n_total}) outside [{lower:.3f}, {upper:.3f}] range.")
+    return filtered
+
+
+def plot_hist_percent(data, title, xlabel, bins=100, xlim=None):
+    """Plot histogram in percentage with per-column outlier filtering."""
+    data_filtered = filter_column_outliers(data, title)
+    plt.figure(figsize=(8, 5))
+    counts, bin_edges = np.histogram(data_filtered, bins=bins)
+    counts = counts / counts.sum() * 100
+    plt.bar(bin_edges[:-1], counts, width=np.diff(bin_edges), align='edge', color='steelblue', alpha=0.7)
+    plt.xlabel(xlabel)
+    plt.ylabel('Frequency (%)')
+    if xlim:
+        plt.xlim(xlim)
+    plt.title(title)
+    print_stats(title, data_filtered)
+    plt.tight_layout()
+    plt.show()
+
+
 # -----------------------------
 # Load all CSV files
 # -----------------------------
@@ -118,7 +151,6 @@ sampling_stats = []
 for file in all_files:
     df = pd.read_csv(file)
     dfs.append(df)
-
     mean_freq, jitter = compute_sampling_stats(df['timestamp'].values)
     sampling_stats.append({'file': file, 'mean_freq': mean_freq, 'jitter': jitter})
 
@@ -134,7 +166,7 @@ print("\nPer-file sampling statistics (valid files only):")
 print(sampling_df_clean.describe())
 
 # -----------------------------
-# Reject outliers
+# Reject unrealistic rows
 # -----------------------------
 full_df = reject_outliers(full_df)
 
@@ -147,80 +179,124 @@ vert_speed = full_df['velocity_down'].values
 t_valid, ang_vel, ang_acc = compute_angular_dynamics(full_df)
 
 # -----------------------------
-# Print statistics
+# Plot each distribution separately + log versions
 # -----------------------------
-print_stats("Speed (km/h)", speed_kmh)
-print_stats("Vertical speed (m/s)", vert_speed)
-for col in LINEAR_VEL_COLS:
-    print_stats(f"Linear acceleration {col} (m/s²)", acc[col])
-for col in ANGLES_COLS:
-    print_stats(f"Angular position {col} (rad)", full_df[col])
-    print_stats(f"Angular velocity {col} (rad/s)", ang_vel[col])
-    print_stats(f"Angular acceleration {col} (rad/s²)", ang_acc[col])
+print("\n=== DISTRIBUTIONS ===\n")
 
-# -----------------------------
-# Plot distributions
-# -----------------------------
-plt.figure(figsize=(15, 10))
+# Folder for saving plots
+OUTPUT_DIR = "./plots"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def plot_hist_percent(ax, data, bins=50, color='b', alpha=0.5, label=None, xlim=None):
-    counts, bin_edges = np.histogram(data, bins=bins)
+# Collect all subplot info
+plot_data = []
+
+def plot_and_save(data, title, xlabel, bins=100, xlim=None, logy=False, save=True):
+    """Plot histogram (normal or log-y) and optionally save it."""
+    data_filtered = filter_column_outliers(data, title)
+    counts, bin_edges = np.histogram(data_filtered, bins=bins)
     counts = counts / counts.sum() * 100
-    ax.bar(bin_edges[:-1], counts, width=np.diff(bin_edges), align='edge', color=color, alpha=alpha, label=label)
-    if label:
-        ax.legend()
-    ax.set_ylabel('Frequency (%)')
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(bin_edges[:-1], counts, width=np.diff(bin_edges), align='edge', color='steelblue', alpha=0.7)
+    plt.xlabel(xlabel)
+    plt.ylabel('Frequency (%)')
     if xlim:
-        ax.set_xlim(xlim)
+        plt.xlim(xlim)
+    if logy:
+        plt.yscale('log')
+        plt.ylabel('Frequency (%) [log]')
+    plt.title(title + (" (log)" if logy else ""))
 
-# Speed
-ax1 = plt.subplot(3, 3, 1)
-plot_hist_percent(ax1, speed_kmh, bins=50, color='skyblue', xlim=(0, 130))
-ax1.set_xlabel('Speed (km/h)')
-ax1.set_title('Speed Distribution')
+    print_stats(title + (" (log)" if logy else ""), data_filtered)
 
-# Vertical speed
-ax2 = plt.subplot(3, 3, 2)
-plot_hist_percent(ax2, vert_speed, bins=50, color='salmon', xlim=(-5, 5))
-ax2.set_xlabel('Vertical speed (m/s)')
-ax2.set_title('Vertical Speed Distribution')
+    plt.tight_layout()
+    if save:
+        safe_title = title.replace(" ", "_").replace("/", "_")
+        fname = os.path.join(OUTPUT_DIR, f"{safe_title}{'_log' if logy else ''}.png")
+        plt.savefig(fname, dpi=200)
+        print(f"Saved: {fname}")
+    plt.close()
 
-# Linear acceleration
-ax3 = plt.subplot(3, 3, 3)
-for col, color in zip(LINEAR_VEL_COLS, ['r','g','b']):
-    plot_hist_percent(ax3, acc[col], bins=50, color=color, label=col, xlim=(-10, 10))
-ax3.set_xlabel('Linear Acceleration (m/s²)')
-ax3.set_title('Linear Acceleration Distribution')
+    # Store for later combined plots
+    plot_data.append({
+        'data': data_filtered,
+        'title': title,
+        'xlabel': xlabel,
+        'bins': bins,
+        'xlim': xlim
+    })
 
-# Angular positions (split)
-ax = plt.subplot(3, 3, 4)
-plot_hist_percent(ax, full_df["roll"], bins=1000, color='c', label="roll", xlim=(-0.2, 0.2))
-ax.set_xlabel('roll (rad)')
-ax.set_title('Angular Position: roll')
 
-ax = plt.subplot(3, 3, 5)
-plot_hist_percent(ax, full_df["pitch"], bins=1000, color='c', label="pitch", xlim=(-0.2, 0.2))
-ax.set_xlabel('pitch (rad)')
-ax.set_title('Angular Position: pitch')
+# ----------- Create and save individual plots -----------
+# Speed and vertical speed
+plot_and_save(speed_kmh, "Speed (km/h)", "Speed (km/h)", bins=100, xlim=(0, 130))
+plot_and_save(speed_kmh, "Speed (km/h)", "Speed (km/h)", bins=100, xlim=(0, 130), logy=True)
 
-ax = plt.subplot(3, 3, 6)
-plot_hist_percent(ax, full_df["yaw"], bins=200, color='c', label="yaw", xlim=(-np.pi, np.pi))
-ax.set_xlabel('yaw (rad)')
-ax.set_title('Angular Position: yaw')
+plot_and_save(vert_speed, "Vertical Speed (m/s)", "Vertical Speed (m/s)", bins=100)
+plot_and_save(vert_speed, "Vertical Speed (m/s)", "Vertical Speed (m/s)", bins=100, logy=True)
 
-# Angular velocity
-ax7 = plt.subplot(3, 3, 7)
-for col, color in zip(ANGLES_COLS, ['r','g','b']):
-    plot_hist_percent(ax7, ang_vel[col], bins=50, color=color, label=col, xlim=(-np.pi, np.pi))
-ax7.set_xlabel('Angular velocity (rad/s)')
-ax7.set_title('Angular Velocity Distribution')
+# Linear accelerations
+for col in LINEAR_VEL_COLS:
+    title = f"Linear Acceleration {col} (m/s²)"
+    plot_and_save(acc[col], title, "Acceleration (m/s²)", bins=100)
+    plot_and_save(acc[col], title, "Acceleration (m/s²)", bins=100, logy=True)
 
-# Angular acceleration
-ax8 = plt.subplot(3, 3, 8)
-for col, color in zip(ANGLES_COLS, ['r','g','b']):
-    plot_hist_percent(ax8, ang_acc[col], bins=50, color=color, label=col, xlim=(-np.pi, np.pi))
-ax8.set_xlabel('Angular acceleration (rad/s²)')
-ax8.set_title('Angular Acceleration Distribution')
+# Angular positions
+for col in ANGLES_COLS:
+    title = f"Angular Position {col} (rad)"
+    plot_and_save(full_df[col], title, f"{col} (rad)", bins=500)
+    plot_and_save(full_df[col], title, f"{col} (rad)", bins=500, logy=True)
 
-plt.tight_layout()
-plt.show()
+# Angular velocities
+for col in ANGLES_COLS:
+    title = f"Angular Velocity {col} (rad/s)"
+    plot_and_save(ang_vel[col], title, f"{col} (rad/s)", bins=100)
+    plot_and_save(ang_vel[col], title, f"{col} (rad/s)", bins=100, logy=True)
+
+# Angular accelerations
+for col in ANGLES_COLS:
+    title = f"Angular Acceleration {col} (rad/s²)"
+    plot_and_save(ang_acc[col], title, f"{col} (rad/s²)", bins=1000)
+    plot_and_save(ang_acc[col], title, f"{col} (rad/s²)", bins=1000, logy=True)
+
+
+# -----------------------------
+# Create condensed summary figures (normal + log)
+# -----------------------------
+def make_summary_plot(plot_data, logy=False, save_name="summary.png"):
+    """Create a grid of subplots combining all histograms."""
+    n = len(plot_data)
+    ncols = 3
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 3))
+    axes = axes.flatten()
+
+    for i, pdict in enumerate(plot_data):
+        ax = axes[i]
+        counts, bin_edges = np.histogram(pdict['data'], bins=pdict['bins'])
+        counts = counts / counts.sum() * 100
+        ax.bar(bin_edges[:-1], counts, width=np.diff(bin_edges), align='edge', color='steelblue', alpha=0.7)
+        ax.set_title(pdict['title'], fontsize=9)
+        ax.set_xlabel(pdict['xlabel'], fontsize=8)
+        ax.set_ylabel('Frequency (%)', fontsize=8)
+        if pdict['xlim']:
+            ax.set_xlim(pdict['xlim'])
+        if logy:
+            ax.set_yscale('log')
+            ax.set_ylabel('Frequency (%) [log]', fontsize=8)
+
+    # Hide unused subplots if any
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    save_path = os.path.join(OUTPUT_DIR, save_name)
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"Saved summary plot: {save_path}")
+
+
+# Save both normal and log summary figures
+make_summary_plot(plot_data, logy=False, save_name="summary_normal.png")
+make_summary_plot(plot_data, logy=True, save_name="summary_log.png")
+
